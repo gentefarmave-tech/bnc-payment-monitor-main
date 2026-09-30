@@ -3,7 +3,7 @@
 // Endpoints mapeados desde: API Payment Gente Appp.postman_collection.json
 // ============================================================
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   AreaChart, Area, BarChart, Bar, XAxis, YAxis,
   CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -15,7 +15,7 @@ import {
   Settings, Sun, XCircle, Zap, ExternalLink, Copy,
   ArrowLeftRight, Clock, Filter, Layers, Send,
   RotateCcw, Wifi, WifiOff, Eye, EyeOff, Terminal,
-  Play, Shield, Webhook, Beaker,
+  Play, Shield, Webhook,
 } from "lucide-react";
 
 // ─────────────────────────────────────────────────────────────
@@ -65,6 +65,7 @@ const ENDPOINTS = {
   p2pPayment: `${P2P_URL}/api/v1/payments/p2p`,
   // ── Webhooks ──────────────────────────────────────────────
   webhookNotification: `${WEBHOOKS_URL}/api/v1/webhooks/notification`,
+  webhookAudit: `${WEBHOOKS_URL}/api/v1/audit`,
   // ── Notifications ─────────────────────────────────────────
   notificationSend: `${NOTIFICATION_URL}/api/v1/notifications/send`,
 };
@@ -119,13 +120,13 @@ interface Transaction {
   lastReconciliationAt?: string | null;
 }
 
-// ── Prototipo: correlación P2P ↔ Webhook ────────────────────
-// NOTA: esta vista es un PROTOTIPO con datos de ejemplo (mock).
-// Hoy no existe backend real para esto:
-//   - GET /api/transactions (msvc-p2p) responde HTTP 500 en producción.
-//   - No hay ningún endpoint de historial de webhooks en ESolutions-API-main.
-// Cuando ambos existan, este mock se reemplaza por un fetch real, igual
-// que fetchTransactions() más abajo.
+// ── Correlación P2P ↔ Webhook ────────────────────────────────
+// Cruza cada transacción P2P (GET /api/transactions, msvc-p2p) con su
+// notificación de BNC correspondiente (GET /api/v1/audit, ESolutions-API-main
+// / msvc-webhooks), usando operationRef === transactionId como llave.
+// Ver hallazgo-timeout-p2p-transaccion-huerfana.md: la "ventana de espera"
+// usa el mismo umbral que el job de reconciliación activa (20 min,
+// p2p.reconciliation.stuck-after-minutes en Config Server).
 type WebhookCorrStatus = "RECEIVED" | "PENDING" | "MISSING" | "NA";
 
 interface WebhookCorrelationRow {
@@ -141,16 +142,68 @@ interface WebhookCorrelationRow {
   latencyMs: number | null;
 }
 
-const MOCK_WEBHOOK_CORRELATION: WebhookCorrelationRow[] = [
-  { operationRef: "998877665001", beneficiaryName: "María Pérez",           beneficiaryId: "V-18234511", amount: 10.01,   bankCode: 191, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:42:08", webhookStatus: "RECEIVED", webhookAt: "2026-09-26T03:42:09", latencyMs: 1200 },
-  { operationRef: "998877665002", beneficiaryName: "Carlos Rangel",         beneficiaryId: "V-20114832", amount: 250.00,  bankCode: 102, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:44:51", webhookStatus: "RECEIVED", webhookAt: "2026-09-26T03:44:53", latencyMs: 2000 },
-  { operationRef: "998877665003", beneficiaryName: "Nibiru Tech Solutions", beneficiaryId: "J-40551223", amount: 1480.50, bankCode: 134, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:47:15", webhookStatus: "PENDING",  webhookAt: null,                  latencyMs: null },
-  { operationRef: "998877665004", beneficiaryName: "Andreína Gómez",        beneficiaryId: "V-24887012", amount: 89.90,   bankCode: 191, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:49:02", webhookStatus: "MISSING",  webhookAt: null,                  latencyMs: null },
-  { operationRef: "998877665005", beneficiaryName: "Luis Fernández",        beneficiaryId: "V-19004477", amount: 500.00,  bankCode: 105, p2pStatus: "FAILED",  p2pAt: "2026-09-26T03:50:37", webhookStatus: "NA",       webhookAt: null,                  latencyMs: null },
-  { operationRef: "998877665006", beneficiaryName: "Gabriela Torres",       beneficiaryId: "V-21556690", amount: 62.40,   bankCode: 191, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:51:44", webhookStatus: "RECEIVED", webhookAt: "2026-09-26T03:51:45", latencyMs: 800 },
-  { operationRef: "998877665007", beneficiaryName: "Pedro Salas",           beneficiaryId: "V-17903345", amount: 305.20,  bankCode: 134, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:53:10", webhookStatus: "RECEIVED", webhookAt: "2026-09-26T03:53:12", latencyMs: 1600 },
-  { operationRef: "998877665008", beneficiaryName: "Yolimar Castillo",      beneficiaryId: "V-22167754", amount: 14.00,   bankCode: 102, p2pStatus: "SUCCESS", p2pAt: "2026-09-26T03:54:29", webhookStatus: "PENDING",  webhookAt: null,                  latencyMs: null },
-];
+interface WebhookAudit {
+  eventId: string;
+  eventType: string | null;
+  transactionId: string | null;
+  status: string;
+  detail: string | null;
+  timestamp: string;
+  ipOrigin: string | null;
+  projectSource: string | null;
+  paymentCategory: string | null;
+}
+
+const WEBHOOK_WAIT_WINDOW_MINUTES = 20;
+
+function buildWebhookCorrelation(txList: Transaction[], audits: WebhookAudit[]): WebhookCorrelationRow[] {
+  const now = Date.now();
+  return txList
+    .filter(tx => tx.type === "P2P")
+    .map(tx => {
+      // Auditorías que llegaron para esta transacción, más recientes primero.
+      const matches = audits
+        .filter(a => a.transactionId === tx.operationRef)
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+      const success = matches.find(a => a.status === "WEBHOOK_SUCCESS" || a.status === "WEBHOOK_RECEIVED");
+      const processing = matches.find(a => a.status === "WEBHOOK_PROCESSING");
+      const errored = matches.find(a => a.status === "WEBHOOK_ERROR" || a.status === "WEBHOOK_DUPLICATE");
+
+      let webhookStatus: WebhookCorrStatus;
+      let webhookAt: string | null = null;
+      let latencyMs: number | null = null;
+
+      if (tx.status !== "SUCCESS") {
+        webhookStatus = "NA";
+      } else if (success) {
+        webhookStatus = "RECEIVED";
+        webhookAt = success.timestamp;
+        latencyMs = new Date(success.timestamp).getTime() - new Date(tx.createdAt).getTime();
+      } else if (processing) {
+        webhookStatus = "PENDING";
+      } else if (errored) {
+        webhookStatus = "MISSING";
+      } else {
+        const minutesSinceP2P = (now - new Date(tx.createdAt).getTime()) / 60000;
+        webhookStatus = minutesSinceP2P < WEBHOOK_WAIT_WINDOW_MINUTES ? "PENDING" : "MISSING";
+      }
+
+      const row: WebhookCorrelationRow = {
+        operationRef: tx.operationRef,
+        beneficiaryName: tx.name ?? "—",
+        beneficiaryId: tx.beneficiaryId ?? "—",
+        amount: tx.amount,
+        bankCode: tx.bankCode ?? 0,
+        p2pStatus: tx.status === "SUCCESS" ? "SUCCESS" : "FAILED",
+        p2pAt: tx.createdAt,
+        webhookStatus,
+        webhookAt,
+        latencyMs,
+      };
+      return row;
+    });
+}
 
 function webhookCorrBadge(status: WebhookCorrStatus): { label: string; className: string } {
   switch (status) {
@@ -327,6 +380,11 @@ export default function App() {
   const [txDetail, setTxDetail]     = useState<Transaction | null>(null);
   const [txSearch, setTxSearch]     = useState("");
 
+  // Correlación P2P ↔ Webhook
+  const [webhookAudits, setWebhookAudits]     = useState<WebhookAudit[]>([]);
+  const [webhookCorrLoading, setWebhookCorrLoading] = useState(false);
+  const [webhookCorrError, setWebhookCorrError]     = useState<string | null>(null);
+
   // P2P form
   const [p2pForm, setP2pForm]       = useState({
     Amount: "10.01", BeneficiaryBankCode: "191",
@@ -456,6 +514,34 @@ export default function App() {
     }
     setTxLoading(false);
   }, [txFilter, addLog]);
+
+  // ── Fetch webhook audit log (para la correlación P2P ↔ Webhook) ──
+  const fetchWebhookAudits = useCallback(async () => {
+    setWebhookCorrLoading(true);
+    setWebhookCorrError(null);
+    addLog("INFO", "Cargando historial de webhooks (audit log)…");
+    try {
+      const params = new URLSearchParams({ page: "0", size: "100", sort: "timestamp,desc" });
+      const res = await fetch(`${ENDPOINTS.webhookAudit}?${params}`, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const content: WebhookAudit[] = data.content ?? data ?? [];
+        setWebhookAudits(content);
+        addLog("OK", `${content.length} registros de auditoría cargados`);
+      } else {
+        setWebhookCorrError(`Audit log: HTTP ${res.status}`);
+        addLog("WARN", `Audit log: HTTP ${res.status}`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Error";
+      setWebhookCorrError(msg);
+      addLog("ERROR", `fetchWebhookAudits: ${msg}`);
+    }
+    setWebhookCorrLoading(false);
+  }, [addLog]);
 
   // ── Send P2P ──────────────────────────────────────────────
   const sendP2P = async () => {
@@ -599,11 +685,20 @@ export default function App() {
 
   // ── Load transactions when tab opens ─────────────────────
   useEffect(() => {
-    if (authed && (activeTab === "transactions" || activeTab === "overview")) {
+    if (authed && (activeTab === "transactions" || activeTab === "overview" || activeTab === "webhookcorr")) {
       fetchTransactions();
+    }
+    if (authed && activeTab === "webhookcorr") {
+      fetchWebhookAudits();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authed, activeTab]);
+
+  // ── Correlación P2P ↔ Webhook: derivada de txList + webhookAudits ──
+  const webhookCorrRows = useMemo(
+    () => buildWebhookCorrelation(txList, webhookAudits),
+    [txList, webhookAudits]
+  );
 
   // ─────────────────────────────────────────────────────────
   // LOGIN SCREEN
@@ -1111,28 +1206,38 @@ export default function App() {
               </div>
             )}
 
-            {/* ══════════ CORRELACIÓN P2P ↔ WEBHOOK (PROTOTIPO) ══════════ */}
+            {/* ══════════ CORRELACIÓN P2P ↔ WEBHOOK ══════════ */}
             {activeTab === "webhookcorr" && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <h2 className="text-white font-bold text-base flex items-center gap-2">
                     <Webhook size={16} className="text-green-400"/> Correlación Webhook
                   </h2>
-                  <span className="flex items-center gap-1.5 px-2.5 py-1 bg-yellow-500/10 border border-yellow-500/30 rounded-full text-yellow-400 text-xs font-semibold">
-                    <Beaker size={12}/> Prototipo — datos de ejemplo
-                  </span>
+                  <button onClick={() => { fetchTransactions(); fetchWebhookAudits(); }} disabled={txLoading || webhookCorrLoading}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded-lg text-white text-xs font-semibold transition-colors disabled:opacity-50">
+                    <RefreshCw size={13} className={(txLoading || webhookCorrLoading) ? "animate-spin" : ""}/>
+                    Actualizar
+                  </button>
                 </div>
 
-                <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 flex items-start gap-2.5 text-xs text-gray-400">
-                  <AlertTriangle size={15} className="text-yellow-400 flex-shrink-0 mt-0.5"/>
-                  <div>
-                    Esta tabla es un <strong className="text-yellow-400">boceto</strong> de cómo se vería el cruce entre
-                    cada transacción P2P y su webhook. Los datos son de ejemplo porque hoy faltan dos piezas en el backend:
-                    <strong className="text-gray-300"> GET /api/transactions</strong> devuelve HTTP 500 en producción (msvc-p2p),
-                    y <strong className="text-gray-300">no existe endpoint de historial de webhooks</strong> en ESolutions-API-main.
-                    En cuanto existan, esta vista se conecta a datos reales igual que la pestaña Transacciones.
+                {txList.length === 0 && (
+                  <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 flex items-start gap-2.5 text-xs text-gray-400">
+                    <AlertTriangle size={15} className="text-yellow-400 flex-shrink-0 mt-0.5"/>
+                    <div>
+                      No hay transacciones P2P cargadas todavía — normalmente porque{" "}
+                      <strong className="text-gray-300">GET /api/transactions</strong> (msvc-p2p) sigue devolviendo
+                      HTTP 500 en producción (hallazgo pendiente). El cruce con el historial de webhooks
+                      (<strong className="text-gray-300">GET /api/v1/audit</strong>, que sí funciona) se arma
+                      automáticamente en cuanto haya transacciones P2P que correlacionar.
+                    </div>
                   </div>
-                </div>
+                )}
+                {webhookCorrError && (
+                  <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-3 flex items-start gap-2.5 text-xs text-red-300">
+                    <AlertTriangle size={15} className="text-red-400 flex-shrink-0 mt-0.5"/>
+                    <div>No se pudo cargar el historial de webhooks: {webhookCorrError}</div>
+                  </div>
+                )}
 
                 <div className="flex flex-wrap gap-4 text-xs text-gray-500 px-1">
                   <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-green-500"/> Webhook confirmado</span>
@@ -1141,52 +1246,58 @@ export default function App() {
                   <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-gray-500"/> N/A — el P2P no fue exitoso</span>
                 </div>
 
-                <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-                  <table className="w-full text-xs">
-                    <thead className="bg-gray-800/60">
-                      <tr>
-                        {["Referencia","Beneficiario","Monto","P2P procesado","Estado P2P","Estado Webhook","Webhook recibido","Latencia"].map(h => (
-                          <th key={h} className="px-3 py-2.5 text-left text-gray-400 font-semibold whitespace-nowrap">{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {MOCK_WEBHOOK_CORRELATION.map(row => {
-                        const badge = webhookCorrBadge(row.webhookStatus);
-                        return (
-                          <tr key={row.operationRef} className="border-t border-gray-800/60 hover:bg-gray-800/30 transition-colors">
-                            <td className="px-3 py-2.5 text-gray-300 font-mono whitespace-nowrap">{row.operationRef}</td>
-                            <td className="px-3 py-2.5 text-gray-300">
-                              {row.beneficiaryName}
-                              <div className="text-gray-600">{row.beneficiaryId}</div>
-                            </td>
-                            <td className="px-3 py-2.5 text-white font-bold whitespace-nowrap">Bs. {row.amount.toLocaleString("es-VE")}</td>
-                            <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.p2pAt.slice(11,19)}</td>
-                            <td className="px-3 py-2.5">
-                              <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${txStatusColor(row.p2pStatus)}`}>
-                                {row.p2pStatus}
-                              </span>
-                            </td>
-                            <td className="px-3 py-2.5">
-                              <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${badge.className}`}>
-                                {badge.label}
-                              </span>
-                            </td>
-                            <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">
-                              {row.webhookAt ? row.webhookAt.slice(11,19) : "—"}
-                            </td>
-                            <td className="px-3 py-2.5 text-gray-400 whitespace-nowrap">
-                              {row.latencyMs != null ? `${(row.latencyMs / 1000).toFixed(1)}s` : "—"}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
+                {webhookCorrRows.length === 0 ? (
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl p-8 text-center text-gray-500 text-sm">
+                    Sin transacciones P2P para correlacionar todavía.
+                  </div>
+                ) : (
+                  <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+                    <table className="w-full text-xs">
+                      <thead className="bg-gray-800/60">
+                        <tr>
+                          {["Referencia","Beneficiario","Monto","P2P procesado","Estado P2P","Estado Webhook","Webhook recibido","Latencia"].map(h => (
+                            <th key={h} className="px-3 py-2.5 text-left text-gray-400 font-semibold whitespace-nowrap">{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {webhookCorrRows.map(row => {
+                          const badge = webhookCorrBadge(row.webhookStatus);
+                          return (
+                            <tr key={row.operationRef} className="border-t border-gray-800/60 hover:bg-gray-800/30 transition-colors">
+                              <td className="px-3 py-2.5 text-gray-300 font-mono whitespace-nowrap">{row.operationRef}</td>
+                              <td className="px-3 py-2.5 text-gray-300">
+                                {row.beneficiaryName}
+                                <div className="text-gray-600">{row.beneficiaryId}</div>
+                              </td>
+                              <td className="px-3 py-2.5 text-white font-bold whitespace-nowrap">Bs. {row.amount.toLocaleString("es-VE")}</td>
+                              <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{row.p2pAt.slice(11,19)}</td>
+                              <td className="px-3 py-2.5">
+                                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${txStatusColor(row.p2pStatus)}`}>
+                                  {row.p2pStatus}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2.5">
+                                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${badge.className}`}>
+                                  {badge.label}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">
+                                {row.webhookAt ? row.webhookAt.slice(11,19) : "—"}
+                              </td>
+                              <td className="px-3 py-2.5 text-gray-400 whitespace-nowrap">
+                                {row.latencyMs != null ? `${(row.latencyMs / 1000).toFixed(1)}s` : "—"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
 
                 <div className="text-gray-600 text-xs px-1">
-                  {MOCK_WEBHOOK_CORRELATION.length} transacciones de ejemplo · cruce propuesto por número de referencia (operationRef).
+                  {webhookCorrRows.length} transaccion(es) P2P · cruce por número de referencia (operationRef) contra {webhookAudits.length} registro(s) de auditoría de webhooks.
                 </div>
               </div>
             )}
