@@ -162,8 +162,18 @@ function buildWebhookCorrelation(txList: Transaction[], audits: WebhookAudit[]):
     .filter(tx => tx.type === "P2P")
     .map(tx => {
       // Auditorías que llegaron para esta transacción, más recientes primero.
+      //
+      // OJO: msvc-webhooks guarda en WebhookAudit.transactionId la referencia
+      // que da el BNC (request.originBankReference(), ej. "59464"), NO nuestro
+      // operationRef interno (ej. "aa2e1900df7f4a98ba1a"). Son campos distintos
+      // en msvc-p2p: TransactionDetailDto.referenceNumber es la que coincide
+      // con el transactionId de la auditoria; operationRef es solo nuestra
+      // referencia interna y nunca aparece en el lado del webhook. Cruzar por
+      // operationRef (como hacia antes esta funcion) nunca encontraba match, y
+      // por eso la pestaña se quedaba en "Pendiente" para siempre aunque el
+      // webhook ya hubiera llegado.
       const matches = audits
-        .filter(a => a.transactionId === tx.operationRef)
+        .filter(a => !!tx.referenceNumber && a.transactionId === tx.referenceNumber)
         .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
       const success = matches.find(a => a.status === "WEBHOOK_SUCCESS" || a.status === "WEBHOOK_RECEIVED");
