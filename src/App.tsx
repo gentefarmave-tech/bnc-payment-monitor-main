@@ -114,6 +114,9 @@ interface Transaction {
   bankCode?: number;
   description?: string;
   createdAt: string;
+  // Reconciliación activa P2P (ver hallazgo-timeout-p2p-transaccion-huerfana.md)
+  reconciliationAttempts?: number;
+  lastReconciliationAt?: string | null;
 }
 
 // ── Prototipo: correlación P2P ↔ Webhook ────────────────────
@@ -319,7 +322,7 @@ export default function App() {
   const [txSummary, setTxSummary]   = useState<TxSummary | null>(null);
   const [txList, setTxList]         = useState<Transaction[]>([]);
   const [hourly, setHourly]         = useState<HourlyStat[]>(FALLBACK_HOURLY);
-  const [txFilter, setTxFilter]     = useState({ type: "", status: "", from: "", to: "", page: 0 });
+  const [txFilter, setTxFilter]     = useState({ type: "", status: "", from: "", to: "", amount: "", beneficiary: "", operationRef: "", page: 0 });
   const [txLoading, setTxLoading]   = useState(false);
   const [txDetail, setTxDetail]     = useState<Transaction | null>(null);
   const [txSearch, setTxSearch]     = useState("");
@@ -413,10 +416,13 @@ export default function App() {
     addLog("INFO", "Cargando transacciones…");
     try {
       const params = new URLSearchParams();
-      if (txFilter.type)   params.set("type",   txFilter.type);
-      if (txFilter.status) params.set("status", txFilter.status);
-      if (txFilter.from)   params.set("from",   txFilter.from);
-      if (txFilter.to)     params.set("to",     txFilter.to);
+      if (txFilter.type)         params.set("type",         txFilter.type);
+      if (txFilter.status)       params.set("status",       txFilter.status);
+      if (txFilter.from)         params.set("from",         txFilter.from);
+      if (txFilter.to)           params.set("to",           txFilter.to);
+      if (txFilter.amount)       params.set("amount",       txFilter.amount);
+      if (txFilter.beneficiary)  params.set("beneficiary",  txFilter.beneficiary);
+      if (txFilter.operationRef) params.set("operationRef", txFilter.operationRef);
       params.set("page", String(txFilter.page));
       params.set("size", "20");
 
@@ -969,6 +975,27 @@ export default function App() {
                       className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-green-500"/>
                   </div>
                   <div>
+                    <label className="text-gray-500 text-xs block mb-1">Monto</label>
+                    <input type="number" step="0.01" value={txFilter.amount}
+                      onChange={e => setTxFilter(f => ({...f, amount: e.target.value, page: 0}))}
+                      placeholder="150.00"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs w-24 focus:outline-none focus:border-green-500"/>
+                  </div>
+                  <div>
+                    <label className="text-gray-500 text-xs block mb-1">Beneficiario</label>
+                    <input value={txFilter.beneficiary}
+                      onChange={e => setTxFilter(f => ({...f, beneficiary: e.target.value, page: 0}))}
+                      placeholder="María Pérez"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-green-500"/>
+                  </div>
+                  <div>
+                    <label className="text-gray-500 text-xs block mb-1">Ref. operación</label>
+                    <input value={txFilter.operationRef}
+                      onChange={e => setTxFilter(f => ({...f, operationRef: e.target.value, page: 0}))}
+                      placeholder="998877…"
+                      className="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-green-500"/>
+                  </div>
+                  <div>
                     <label className="text-gray-500 text-xs block mb-1">Buscar ID/Ref</label>
                     <input value={txSearch} onChange={e => setTxSearch(e.target.value)}
                       onKeyDown={e => e.key === "Enter" && fetchTxDetail(txSearch)}
@@ -1012,7 +1039,7 @@ export default function App() {
                     <table className="w-full text-xs">
                       <thead className="bg-gray-800/60">
                         <tr>
-                          {["ID","Ref","Tipo","Estado","Monto","Beneficiario","Fecha",""].map(h => (
+                          {["ID","Ref","Tipo","Estado","Monto","Beneficiario","Fecha","Reconciliación",""].map(h => (
                             <th key={h} className="px-3 py-2.5 text-left text-gray-400 font-semibold">{h}</th>
                           ))}
                         </tr>
@@ -1031,6 +1058,16 @@ export default function App() {
                             <td className="px-3 py-2.5 text-white font-bold">{tx.amount?.toLocaleString("es-VE")}</td>
                             <td className="px-3 py-2.5 text-gray-300">{tx.name ?? "—"}</td>
                             <td className="px-3 py-2.5 text-gray-500">{tx.createdAt?.slice(0,16).replace("T"," ")}</td>
+                            <td className="px-3 py-2.5">
+                              {tx.reconciliationAttempts ? (
+                                <span title={tx.lastReconciliationAt ? `Última consulta a BNC: ${tx.lastReconciliationAt.slice(0,16).replace("T"," ")}` : "Aún no se ha consultado a BNC"}
+                                  className="px-2 py-0.5 rounded-full text-xs font-semibold bg-yellow-500/20 text-yellow-400 border border-yellow-500/40">
+                                  {tx.reconciliationAttempts} intento{tx.reconciliationAttempts === 1 ? "" : "s"}
+                                </span>
+                              ) : (
+                                <span className="text-gray-600">—</span>
+                              )}
+                            </td>
                             <td className="px-3 py-2.5">
                               <button onClick={() => fetchTxDetail(String(tx.id))}
                                 className="text-gray-500 hover:text-green-400 transition-colors">
