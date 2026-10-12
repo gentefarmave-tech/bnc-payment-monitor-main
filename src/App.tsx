@@ -454,10 +454,20 @@ export default function App() {
     addLog("INFO", "Cargando historial de webhooks (audit log)…");
     try {
       const params = new URLSearchParams({ page: "0", size: "100", sort: "timestamp,desc" });
-      const res = await api(`/api/audit?${params}`);
+      // Auditoría de webhooks + errores del propio P2P (rechazos del banco, inciertos): viven en tablas distintas.
+      const [res, p2pRes] = await Promise.all([
+        api(`/api/audit?${params}`),
+        api("/api/p2p-audit").catch(() => null),
+      ]);
       if (res.ok) {
         const data = await res.json();
-        const content: WebhookAudit[] = data.content ?? data ?? [];
+        const webhookPart: WebhookAudit[] = data.content ?? data ?? [];
+        let p2pPart: WebhookAudit[] = [];
+        if (p2pRes && p2pRes.ok) {
+          const d = await p2pRes.json();
+          p2pPart = d.content ?? [];
+        }
+        const content = [...webhookPart, ...p2pPart];
         setWebhookAudits(content);
         addLog("OK", `${content.length} registros de auditoría cargados`);
       } else {
