@@ -10,87 +10,27 @@ import {
 } from "recharts";
 import {
   Activity, AlertTriangle, Bell, CheckCircle2,
-  ChevronRight, CreditCard, Database,
+  ChevronRight, CreditCard,
   Home, LogOut, Menu, Moon, RefreshCw,
-  Settings, Sun, XCircle, Zap, ExternalLink, Copy,
+  Sun, XCircle, Zap, Copy,
   ArrowLeftRight, Clock, Filter, Layers, Send,
   RotateCcw, Wifi, WifiOff, Eye, EyeOff, Terminal,
-  Play, Shield, Webhook,
+  Play, Shield, Webhook, Loader2,
 } from "lucide-react";
 import {
   describeAuditEvent, WEBHOOK_OK_STATUSES, WEBHOOK_BAD_STATUSES,
   type WebhookAudit, type EventLevel,
 } from "./eventos";
+import {
+  api, login, fetchFeatures, getSession, clearSession, setUnauthorizedHandler,
+  type Features,
+} from "./api";
 
 // ─────────────────────────────────────────────────────────────
-// ENDPOINTS REALES — mapeados de la colección Postman
+// El panel solo habla con monitor-api (ver ./api.ts). Ya no conoce URLs de
+// microservicios, ni del Config Server, ni credenciales del banco.
 // ─────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
-// BASE URLs — configurables via variables de entorno (Vite: VITE_*).
-// En Railway, cada una de estas se define como Variable del servicio
-// y Vite las incluye en el build (npm run build). Los valores de abajo
-// son el fallback de Production, por si alguna variable no esta seteada.
-// Ver .env.example para la lista completa.
-// ─────────────────────────────────────────────────────────────
-const EUREKA_URL           = import.meta.env.VITE_EUREKA_URL           || "https://eureka-server-main-production.up.railway.app";
-const CONFIG_SERVER_URL    = import.meta.env.VITE_CONFIG_SERVER_URL    || "https://config-server-main-production.up.railway.app";
-const WEBHOOKS_URL         = import.meta.env.VITE_WEBHOOKS_URL         || "https://esolutions-api-main-production.up.railway.app";
-const P2P_URL              = import.meta.env.VITE_P2P_URL              || "https://msvc-p2p-production.up.railway.app";
-const EVENT_DISPATCHER_URL = import.meta.env.VITE_EVENT_DISPATCHER_URL || "https://msvc-event-dispatcher-production.up.railway.app";
-const NOTIFICATION_URL     = import.meta.env.VITE_NOTIFICATION_URL     || "https://msvc-notification-main-production.up.railway.app";
-
-const ENDPOINTS = {
-  // ── Health / Actuator ────────────────────────────────────
-  health: {
-    eureka:         `${EUREKA_URL}/actuator/health`,
-    eurekaMetrics:  `${EUREKA_URL}/actuator/metrics`,
-    configServer:   `${CONFIG_SERVER_URL}/actuator/health`,
-    configRefresh:  `${CONFIG_SERVER_URL}/actuator/refresh`,
-    webhooks:       `${WEBHOOKS_URL}/actuator/health`,
-    p2p:            `${P2P_URL}/actuator/health`,
-    p2pRefresh:     `${P2P_URL}/actuator/refresh`,
-    reconciliation: `${EVENT_DISPATCHER_URL}/api/v1/health/reconciliation`,
-  },
-  // ── Config Server ────────────────────────────────────────
-  config: {
-    webhooksDefault: `${CONFIG_SERVER_URL}/msvc-webhooks/default`,
-    webhooksStaging: `${CONFIG_SERVER_URL}/msvc-webhooks/staging`,
-    webhooksProd:    `${CONFIG_SERVER_URL}/msvc-webhooks/prod`,
-  },
-  // ── Transactions (P2P Service) ────────────────────────────
-  transactions: {
-    baseUrl:  P2P_URL,
-    list:     `${P2P_URL}/api/transactions`,
-    summary:  `${P2P_URL}/api/transactions/summary`,
-    hourly:   `${P2P_URL}/api/transactions/hourly`,
-    detail:   (id: string) => `${P2P_URL}/api/transactions/${id}`,
-  },
-  // ── P2P Payment ───────────────────────────────────────────
-  p2pPayment: `${P2P_URL}/api/v1/payments/p2p`,
-  // ── Webhooks ──────────────────────────────────────────────
-  webhookNotification: `${WEBHOOKS_URL}/api/v1/webhooks/notification`,
-  webhookAudit: `${WEBHOOKS_URL}/api/v1/audit`,
-  // ── Notifications ─────────────────────────────────────────
-  notificationSend: `${NOTIFICATION_URL}/api/v1/notifications/send`,
-};
-
-// Credenciales — YA NO se hardcodean. Vienen de variables de entorno
-// (locales via .env, en Railway via Variables del servicio). Si faltan,
-// la app sigue arrancando pero avisa en consola y los requests que las
-// necesiten van a fallar con 401/403 hasta que se configuren.
-// El disparador de webhooks de prueba queda OCULTO salvo que se active explicitamente.
-const ENABLE_WEBHOOK_TRIGGER = import.meta.env.VITE_ENABLE_WEBHOOK_TRIGGER === "true";
-const API_KEY    = import.meta.env.VITE_BNC_API_KEY    || "";
-const AUTH_TOKEN = import.meta.env.VITE_BNC_AUTH_TOKEN || "";
-if (!API_KEY || !AUTH_TOKEN) {
-  console.warn(
-    "[BNC Monitor] Faltan VITE_BNC_API_KEY / VITE_BNC_AUTH_TOKEN. " +
-    "Configura tu .env local (ver .env.example) o las Variables del servicio en Railway."
-  );
-}
-// TENANT_ID ("50") pendiente: no hay accion de UI que llame a notificationSend todavia,
-// por eso no se usa aun. Cuando se implemente el test de Notification, agregar
-// header "X-Tenant-ID" con el tenant correspondiente a ese fetch.
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 // ─────────────────────────────────────────────────────────────
 // TIPOS
@@ -99,7 +39,7 @@ type ServiceStatus = "UP" | "DOWN" | "LOADING" | "UNKNOWN";
 
 interface ServiceHealth {
   name: string;
-  key: keyof typeof ENDPOINTS.health;
+  key: string;
   status: ServiceStatus;
   latencyMs: number | null;
   lastChecked: Date | null;
@@ -284,78 +224,18 @@ const txStatusColor = (s: string) => {
   return "text-gray-400 bg-gray-700";
 };
 
-async function fetchHealth(url: string, method: "GET" | "POST" = "GET"): Promise<{ status: ServiceStatus; detail: string; latencyMs: number }> {
-  const t0 = Date.now();
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(8000),
-    });
-    const latencyMs = Date.now() - t0;
-    if (!res.ok) {
-      return { status: "DOWN", detail: `HTTP ${res.status}`, latencyMs };
-    }
-    let detail = "UP";
-    let overallStatus: ServiceStatus = "UP";
-    try {
-      const data = await res.json();
-      detail = data?.status ?? (data?.healthy ? "UP" : "OK");
-      // Algunos endpoints (ej. reconciliation) devuelven HTTP 200 aunque el
-      // estado real sea malo (status: "RED"/"DOWN"/"FAILED"). Reflejarlo.
-      if (typeof data?.status === "string" && ["RED", "DOWN", "FAILED", "ERROR"].includes(data.status.toUpperCase())) {
-        overallStatus = "DOWN";
-      }
-    } catch { /* ignore */ }
-    return { status: overallStatus, detail, latencyMs };
-  } catch (err: unknown) {
-    const latencyMs = Date.now() - t0;
-    const msg = err instanceof Error ? err.message : "Network error";
-    return { status: "DOWN", detail: msg.slice(0, 60), latencyMs };
-  }
-}
-
 // ─────────────────────────────────────────────────────────────
 // RECONCILIATION — poll dedicado con mas detalle (DLQ / incidentes)
 // ─────────────────────────────────────────────────────────────
-async function fetchReconciliation(url: string): Promise<ReconciliationInfo> {
-  const t0 = Date.now();
-  try {
-    const res = await fetch(url, {
-      headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(8000),
-    });
-    const latencyMs = Date.now() - t0;
-    if (!res.ok) {
-      return { status: "UNKNOWN", dlqMessagesPending: null, connectionStatus: null, unresolvedIncidents: null, latencyMs, lastChecked: new Date(), error: `HTTP ${res.status}` };
-    }
-    const data = await res.json();
-    return {
-      status: typeof data?.status === "string" ? data.status : "UNKNOWN",
-      dlqMessagesPending: typeof data?.dlqMessagesPending === "number" ? data.dlqMessagesPending : null,
-      connectionStatus: typeof data?.connectionStatus === "string" ? data.connectionStatus : null,
-      unresolvedIncidents: typeof data?.unresolvedIncidents === "number" ? data.unresolvedIncidents : null,
-      latencyMs,
-      lastChecked: new Date(),
-      error: null,
-    };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Network error";
-    return { status: "UNKNOWN", dlqMessagesPending: null, connectionStatus: null, unresolvedIncidents: null, latencyMs: Date.now() - t0, lastChecked: new Date(), error: msg.slice(0, 80) };
-  }
-}
 
 // ─────────────────────────────────────────────────────────────
 // INITIAL SERVICE LIST
 // ─────────────────────────────────────────────────────────────
 const INITIAL_SERVICES: ServiceHealth[] = [
   { name: "Eureka Server",         key: "eureka",         status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
-  { name: "Eureka Metrics",        key: "eurekaMetrics",  status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
   { name: "Config Server",         key: "configServer",   status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
-  { name: "Config Refresh",        key: "configRefresh",  status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
   { name: "Webhooks Service",      key: "webhooks",       status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
   { name: "P2P Service",           key: "p2p",            status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
-  { name: "P2P Refresh",           key: "p2pRefresh",     status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—", method: "POST" },
   { name: "Worker Reconciliation", key: "reconciliation", status: "UNKNOWN", latencyMs: null, lastChecked: null, detail: "—" },
 ];
 
@@ -374,8 +254,13 @@ const FALLBACK_HOURLY: HourlyStat[] = Array.from({ length: 24 }, (_, i) => ({
 export default function App() {
   const [darkMode, setDarkMode]     = useState(true);
   const [sidebarOpen, setSidebar]   = useState(true);
-  const [activeTab, setActiveTab]   = useState<"overview" | "health" | "transactions" | "webhookcorr" | "p2p" | "webhooks" | "config" | "logs">("overview");
-  const [authed, setAuthed]         = useState(false);
+  const [activeTab, setActiveTab]   = useState<"overview" | "health" | "transactions" | "webhookcorr" | "p2p" | "webhooks" | "logs">("overview");
+  const [authed, setAuthed]         = useState<boolean>(() => !!getSession());
+  const [features, setFeatures]     = useState<Features>({ p2p: false, webhook: false });
+  const [whPrefilling, setWhPrefilling] = useState(false);
+  const [whPrefillNote, setWhPrefillNote] = useState("");
+  const [autoFillWebhook, setAutoFillWebhook] = useState(true);
+  const [loginBusy, setLoginBusy]   = useState(false);
   const [loginUser, setLoginUser]   = useState("");
   const [loginPass, setLoginPass]   = useState("");
   const [showPass, setShowPass]     = useState(false);
@@ -422,10 +307,7 @@ export default function App() {
   const [whResult, setWhResult]     = useState("");
   const [whLoading, setWhLoading]   = useState(false);
 
-  // Config
-  const [configEnv, setConfigEnv]   = useState<"default" | "staging" | "prod">("staging");
-  const [configData, setConfigData] = useState<string>("");
-  const [configLoading, setConfigLoading] = useState(false);
+  // Refresh P2P
   const [refreshResult, setRefreshResult] = useState("");
   const [refreshLoading, setRefreshLoading] = useState(false);
 
@@ -444,50 +326,79 @@ export default function App() {
   }, []);
 
   // ── Auth ────────────────────────────────────────────────
-  const handleLogin = (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (loginUser === "admin" && loginPass === "bnc2026") {
+    setLoginErr("");
+    setLoginBusy(true);
+    try {
+      const sess = await login(loginUser.trim(), loginPass);
+      setLoginPass("");
+      setFeatures(await fetchFeatures());
       setAuthed(true);
-      addLog("OK", "Sesión iniciada como admin");
-    } else {
-      setLoginErr("Credenciales incorrectas");
+      addLog("OK", `Sesión iniciada como ${sess.username} (${sess.role})`);
+    } catch (err: unknown) {
+      setLoginErr(err instanceof Error ? err.message : "No se pudo iniciar sesión");
     }
+    setLoginBusy(false);
   };
 
-  // ── Check individual service ─────────────────────────────
-  const checkService = useCallback(async (idx: number) => {
-    setServices(prev => prev.map((s, i) => i === idx ? { ...s, status: "LOADING" } : s));
-    const svc = INITIAL_SERVICES[idx];
-    const url = ENDPOINTS.health[svc.key];
-    const method = svc.method ?? "GET";
-    addLog("INFO", `Checking ${svc.name}…`);
-    const result = await fetchHealth(url, method);
-    setServices(prev => prev.map((s, i) =>
-      i === idx ? { ...s, ...result, lastChecked: new Date() } : s
-    ));
-    addLog(result.status === "UP" ? "OK" : "ERROR", `${svc.name}: ${result.status} (${result.latencyMs}ms)`);
+  const handleLogout = useCallback(() => {
+    clearSession();
+    setAuthed(false);
+    setFeatures({ p2p: false, webhook: false });
+  }, []);
+
+  // Si el token vence o el servidor lo rechaza, volver al login.
+  useEffect(() => {
+    setUnauthorizedHandler(() => { handleLogout(); setLoginErr("La sesión expiró. Ingresa de nuevo."); });
+    return () => setUnauthorizedHandler(null);
+  }, [handleLogout]);
+
+  // Al recargar la pagina con sesion vigente, recuperar que acciones de prueba estan habilitadas.
+  useEffect(() => {
+    if (authed) fetchFeatures().then(setFeatures);
+  }, [authed]);
+
+  // ── Salud de servicios: UNA llamada a monitor-api (el consulta por la red privada) ──
+  const loadHealth = useCallback(async (silent = false) => {
+    if (!silent) {
+      setChecking(true);
+      addLog("INFO", "Verificando todos los servicios…");
+      setServices(prev => prev.map(s => ({ ...s, status: "LOADING" as ServiceStatus })));
+    }
+    try {
+      const res = await api("/api/health/services");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const list: Array<{ key: string; status: ServiceStatus; detail: string; latencyMs: number | null; extra?: Record<string, unknown> }> = data.services ?? [];
+      setServices(prev => prev.map(s => {
+        const r = list.find(x => x.key === s.key);
+        return r ? { ...s, status: r.status, detail: r.detail ?? "—", latencyMs: r.latencyMs, lastChecked: new Date() } : s;
+      }));
+      const rec = list.find(x => x.key === "reconciliation");
+      if (rec) {
+        const e = rec.extra ?? {};
+        setReconInfo({
+          status: typeof e.status === "string" ? e.status : (rec.status === "UP" ? "GREEN" : "UNKNOWN"),
+          dlqMessagesPending: typeof e.dlqMessagesPending === "number" ? e.dlqMessagesPending : null,
+          connectionStatus: typeof e.connectionStatus === "string" ? e.connectionStatus : null,
+          unresolvedIncidents: typeof e.unresolvedIncidents === "number" ? e.unresolvedIncidents : null,
+          latencyMs: rec.latencyMs ?? 0,
+          lastChecked: new Date(),
+          error: rec.status === "DOWN" && !rec.extra ? rec.detail : null,
+        });
+      }
+      if (!silent) list.forEach(r => addLog(r.status === "UP" ? "OK" : "ERROR", `${r.key}: ${r.status} (${r.latencyMs ?? "—"}ms — ${r.detail})`));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Error";
+      setServices(prev => prev.map(s => ({ ...s, status: "DOWN" as ServiceStatus, detail: msg.slice(0, 60), lastChecked: new Date() })));
+      setReconInfo(prev => ({ status: "UNKNOWN", dlqMessagesPending: null, connectionStatus: null, unresolvedIncidents: null, latencyMs: 0, lastChecked: new Date(), error: msg.slice(0, 80), ...(prev ? {} : {}) }));
+      if (!silent) addLog("ERROR", `Health check: ${msg}`);
+    }
+    if (!silent) { setChecking(false); addLog("INFO", "Health check completado."); }
   }, [addLog]);
 
-  // ── Check all services ───────────────────────────────────
-  const checkAll = useCallback(async () => {
-    setChecking(true);
-    addLog("INFO", "Verificando todos los servicios…");
-    setServices(prev => prev.map(s => ({ ...s, status: "LOADING" as ServiceStatus })));
-    await Promise.all(
-      INITIAL_SERVICES.map(async (svc, idx) => {
-        const url = ENDPOINTS.health[svc.key];
-        const method = svc.method ?? "GET";
-        const result = await fetchHealth(url, method);
-        setServices(prev => prev.map((s, i) =>
-          i === idx ? { ...s, ...result, lastChecked: new Date() } : s
-        ));
-        addLog(result.status === "UP" ? "OK" : "ERROR",
-          `${svc.name}: ${result.status} (${result.latencyMs}ms — ${result.detail})`);
-      })
-    );
-    setChecking(false);
-    addLog("INFO", "Health check completado.");
-  }, [addLog]);
+  const checkAll = useCallback(() => loadHealth(false), [loadHealth]);
 
   // ── Fetch transactions ────────────────────────────────────
   const fetchTransactions = useCallback(async () => {
@@ -506,9 +417,9 @@ export default function App() {
       params.set("size", "20");
 
       const [listRes, summaryRes, hourlyRes] = await Promise.all([
-        fetch(`${ENDPOINTS.transactions.list}?${params}`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
-        fetch(ENDPOINTS.transactions.summary, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
-        fetch(ENDPOINTS.transactions.hourly,  { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(10000) }),
+        api(`/api/transactions?${params}`),
+        api("/api/transactions/summary"),
+        api("/api/transactions/hourly"),
       ]);
 
       if (listRes.ok) {
@@ -543,10 +454,7 @@ export default function App() {
     addLog("INFO", "Cargando historial de webhooks (audit log)…");
     try {
       const params = new URLSearchParams({ page: "0", size: "100", sort: "timestamp,desc" });
-      const res = await fetch(`${ENDPOINTS.webhookAudit}?${params}`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(10000),
-      });
+      const res = await api(`/api/audit?${params}`);
       if (res.ok) {
         const data = await res.json();
         const content: WebhookAudit[] = data.content ?? data ?? [];
@@ -565,24 +473,55 @@ export default function App() {
   }, [addLog]);
 
   // ── Send P2P ──────────────────────────────────────────────
+  // Si el disparador de webhook esta habilitado en monitor-api, al terminar el pago se
+  // precargan los datos del webhook con lo que devolvio el banco (referencia, monto, fecha, hora…)
+  // para simular la notificacion real sin transcribir nada a mano.
+  const prefillWebhookFrom = async (amount: number, bankReference: string, input: typeof p2pForm) => {
+    setWhPrefilling(true);
+    setWhPrefillNote("");
+    await sleep(1300); // efecto de carga: se ve que el panel "recibe" los datos del banco
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const digits = input.BeneficiaryCellPhone.replace(/\D/g, "");
+    setWhForm(f => ({
+      ...f,
+      OriginBankReference: bankReference,
+      Amount: amount.toFixed(2),
+      Hour: `${pad(d.getHours())}${pad(d.getMinutes())}`,
+      Date: `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`,
+      ClientPhone: digits ? `00${digits}` : f.ClientPhone,
+      Concept: input.Description || f.Concept,
+    }));
+    setWhPrefillNote(`Datos cargados desde el pago con referencia ${bankReference}. Revísalos y pulsa "Disparar Webhook".`);
+    setWhPrefilling(false);
+  };
+
   const sendP2P = async () => {
     setP2pLoading(true);
     setP2pResult("");
+    setWhPrefillNote("");
     addLog("INFO", `Enviando P2P → ${p2pForm.BeneficiaryName} (${p2pForm.Amount})`);
     try {
-      const res = await fetch(ENDPOINTS.p2pPayment, {
+      const sent = { ...p2pForm };
+      const amount = parseFloat(sent.Amount);
+      const res = await api("/api/p2p/send", {
         method: "POST",
-        headers: {
-          "Content-Type":  "application/json",
-          "x-api-key":     API_KEY,
-          "Authorization": AUTH_TOKEN,
-        },
-        body: JSON.stringify({ ...p2pForm, Amount: parseFloat(p2pForm.Amount), BeneficiaryBankCode: parseInt(p2pForm.BeneficiaryBankCode) }),
-        signal: AbortSignal.timeout(15000),
+        body: { ...sent, Amount: amount, BeneficiaryBankCode: parseInt(sent.BeneficiaryBankCode) },
+        timeoutMs: 35000,
       });
       const text = await res.text();
       setP2pResult(text);
       addLog(res.ok ? "OK" : "WARN", `P2P response: HTTP ${res.status}`);
+      if (res.ok && features.webhook && autoFillWebhook) {
+        let reference = "";
+        try { reference = String(JSON.parse(text)?.reference ?? ""); } catch { /* respuesta no JSON */ }
+        if (reference) {
+          setP2pLoading(false);
+          await prefillWebhookFrom(amount, reference, sent);
+          return;
+        }
+        addLog("WARN", "El pago no devolvió referencia del banco; no se precargó el webhook.");
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Error";
       setP2pResult(`ERROR: ${msg}`);
@@ -591,22 +530,13 @@ export default function App() {
     setP2pLoading(false);
   };
 
-  // ── Send Webhook ──────────────────────────────────────────
+  // ── Send Webhook (monitor-api pone las credenciales; el navegador no las ve) ──
   const sendWebhook = async () => {
     setWhLoading(true);
     setWhResult("");
-    addLog("INFO", `Disparando webhook → ${ENDPOINTS.webhookNotification}`);
+    addLog("INFO", "Disparando webhook de prueba (vía monitor-api)…");
     try {
-      const res = await fetch(ENDPOINTS.webhookNotification, {
-        method: "POST",
-        headers: {
-          "Content-Type":  "application/json",
-          "x-api-key":     API_KEY,
-          "Authorization": AUTH_TOKEN,
-        },
-        body: JSON.stringify(whForm),
-        signal: AbortSignal.timeout(15000),
-      });
+      const res = await api("/api/webhooks/test", { method: "POST", body: whForm, timeoutMs: 20000 });
       const text = await res.text();
       setWhResult(text);
       addLog(res.ok ? "OK" : "WARN", `Webhook response: HTTP ${res.status}`);
@@ -618,40 +548,13 @@ export default function App() {
     setWhLoading(false);
   };
 
-  // ── Load config ───────────────────────────────────────────
-  const loadConfig = async () => {
-    setConfigLoading(true);
-    setConfigData("");
-    const url = ENDPOINTS.config[`webhooks${configEnv.charAt(0).toUpperCase() + configEnv.slice(1)}` as keyof typeof ENDPOINTS.config];
-    addLog("INFO", `Config Server → ${url}`);
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      const text = await res.text();
-      try {
-        setConfigData(JSON.stringify(JSON.parse(text), null, 2));
-      } catch {
-        setConfigData(text);
-      }
-      addLog(res.ok ? "OK" : "WARN", `Config: HTTP ${res.status}`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Error";
-      setConfigData(`ERROR: ${msg}`);
-      addLog("ERROR", msg);
-    }
-    setConfigLoading(false);
-  };
-
   // ── P2P Actuator Refresh ──────────────────────────────────
   const triggerP2PRefresh = async () => {
     setRefreshLoading(true);
     setRefreshResult("");
     addLog("INFO", "Disparando actuator/refresh en P2P Service…");
     try {
-      const res = await fetch(ENDPOINTS.health.p2pRefresh, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(15000),
-      });
+      const res = await api("/api/admin/p2p/refresh", { method: "POST", timeoutMs: 20000 });
       const text = await res.text();
       setRefreshResult(text || `HTTP ${res.status} — OK`);
       addLog(res.ok ? "OK" : "WARN", `P2P Refresh: HTTP ${res.status}`);
@@ -667,10 +570,7 @@ export default function App() {
   const fetchTxDetail = async (id: string) => {
     addLog("INFO", `Buscando transacción: ${id}`);
     try {
-      const res = await fetch(ENDPOINTS.transactions.detail(id), {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(10000),
-      });
+      const res = await api(`/api/transactions/${encodeURIComponent(id)}`);
       if (res.ok) {
         const d = await res.json();
         setTxDetail(d);
@@ -689,20 +589,13 @@ export default function App() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // ── Poll reconciliation (DLQ / incidentes) cada 20s ──────
-  // Corre aparte del "Check All" manual para que la alerta de
-  // arriba se mantenga al dia sin que el usuario tenga que hacer nada.
+  // ── Salud + conciliacion (DLQ / incidentes) cada 20s, en silencio ──
   useEffect(() => {
     if (!authed) return;
-    let cancelled = false;
-    const poll = async () => {
-      const info = await fetchReconciliation(ENDPOINTS.health.reconciliation);
-      if (!cancelled) setReconInfo(info);
-    };
-    poll();
-    const id = setInterval(poll, 20000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [authed]);
+    const first = setTimeout(() => loadHealth(true), 0);
+    const id = setInterval(() => loadHealth(true), 20000);
+    return () => { clearTimeout(first); clearInterval(id); };
+  }, [authed, loadHealth]);
 
   // ── Load transactions when tab opens ─────────────────────
   useEffect(() => {
@@ -786,11 +679,10 @@ export default function App() {
               </div>
             </div>
             {loginErr && <p className="text-red-400 text-xs">{loginErr}</p>}
-            <button type="submit"
-              className="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg text-sm transition-colors">
-              Ingresar
+            <button type="submit" disabled={loginBusy}
+              className="w-full bg-green-600 hover:bg-green-500 text-white font-semibold py-2 rounded-lg text-sm transition-colors disabled:opacity-50">
+              {loginBusy ? "Ingresando…" : "Ingresar"}
             </button>
-            <p className="text-center text-gray-600 text-xs">admin / bnc2026</p>
           </form>
         </div>
       </div>
@@ -806,7 +698,6 @@ export default function App() {
     { id: "transactions", icon: <CreditCard size={16}/>,   label: "Transacciones" },
     { id: "webhookcorr",  icon: <Webhook size={16}/>,        label: "Correlación Webhook" },
     { id: "p2p",          icon: <ArrowLeftRight size={16}/>, label: "P2P / Webhooks" },
-    { id: "config",       icon: <Settings size={16}/>,     label: "Config Server" },
     { id: "logs",         icon: <Terminal size={16}/>,     label: "Actividad" },
   ] as const;
 
@@ -854,7 +745,7 @@ export default function App() {
               {darkMode ? <Sun size={16}/> : <Moon size={16}/>}
               {sidebarOpen && <span>{darkMode ? "Light" : "Dark"}</span>}
             </button>
-            <button onClick={() => setAuthed(false)}
+            <button onClick={handleLogout}
               className="w-full flex items-center gap-2 px-2 py-2 rounded-lg text-xs text-gray-400 hover:text-red-400 hover:bg-gray-800">
               <LogOut size={16}/>
               {sidebarOpen && <span>Salir</span>}
@@ -1019,7 +910,7 @@ export default function App() {
                           )}
                         </div>
                         <div className="text-gray-500 text-xs truncate">
-                          {ENDPOINTS.health[svc.key]}
+                          vía monitor-api
                         </div>
                         {svc.lastChecked && (
                           <div className="text-gray-600 text-xs flex items-center gap-1 mt-0.5">
@@ -1050,7 +941,7 @@ export default function App() {
                       </div>
 
                       {/* Check button */}
-                      <button onClick={() => checkService(idx)}
+                      <button onClick={checkAll}
                         className="flex-shrink-0 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors">
                         <RefreshCw size={14}/>
                       </button>
@@ -1058,11 +949,6 @@ export default function App() {
                   ))}
                 </div>
 
-                {/* External link to Eureka */}
-                <a href={EUREKA_URL} target="_blank" rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-xs text-blue-400 hover:text-blue-300 transition-colors">
-                  <ExternalLink size={12}/> Abrir Eureka Dashboard
-                </a>
               </div>
             )}
 
@@ -1364,8 +1250,19 @@ export default function App() {
                     <div className="flex items-center gap-2 mb-2">
                       <Send size={14} className="text-blue-400"/>
                       <span className="text-white font-semibold text-sm">Enviar P2P</span>
-                      <span className="text-xs text-gray-500 ml-auto">POST /api/v1/payments/p2p</span>
+                      <span className="text-xs text-gray-500 ml-auto">POST /api/p2p/send</span>
                     </div>
+                    {!features.p2p && (
+                      <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-lg p-2.5 text-xs text-yellow-300">
+                        El envío de pagos de prueba está desactivado en este ambiente (monitor-api: ENABLE_TEST_ACTIONS=false).
+                      </div>
+                    )}
+                    {features.webhook && (
+                      <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer select-none">
+                        <input type="checkbox" checked={autoFillWebhook} onChange={e => setAutoFillWebhook(e.target.checked)} className="accent-purple-500"/>
+                        Al enviar, cargar los datos del pago en el webhook (simula la notificación del banco)
+                      </label>
+                    )}
                     {(["Amount","BeneficiaryBankCode","BeneficiaryCellPhone","BeneficiaryEmail","BeneficiaryID","BeneficiaryName","Description"] as Array<keyof typeof p2pForm>).map(field => (
                       <div key={field}>
                         <label className="text-gray-500 text-xs block mb-0.5">{field}</label>
@@ -1373,10 +1270,10 @@ export default function App() {
                           className="w-full bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-blue-500"/>
                       </div>
                     ))}
-                    <button onClick={sendP2P} disabled={p2pLoading}
+                    <button onClick={sendP2P} disabled={p2pLoading || whPrefilling || !features.p2p}
                       className="w-full flex items-center justify-center gap-2 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-white text-xs font-bold transition-colors disabled:opacity-50">
                       <Play size={13} className={p2pLoading ? "animate-pulse" : ""}/>
-                      {p2pLoading ? "Enviando…" : "Enviar P2P"}
+                      {p2pLoading ? "Enviando…" : whPrefilling ? "Cargando webhook…" : "Enviar P2P"}
                     </button>
                     {p2pResult && (
                       <div className="relative">
@@ -1391,13 +1288,13 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Webhook Form — solo si VITE_ENABLE_WEBHOOK_TRIGGER=true (apagado por defecto: el incidente del 2026-09-02 fue un webhook de prueba disparado desde produccion) */}
-                  {ENABLE_WEBHOOK_TRIGGER && (
+                  {/* Webhook Form — solo si monitor-api tiene ENABLE_WEBHOOK_TRIGGER=true (apagado por defecto: el incidente del 2026-09-02 fue un webhook de prueba disparado desde produccion) */}
+                  {features.webhook && (
                   <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
                     <div className="flex items-center gap-2 mb-2">
                       <Bell size={14} className="text-purple-400"/>
                       <span className="text-white font-semibold text-sm">Disparar Webhook</span>
-                      <span className="text-xs text-gray-500 ml-auto">POST /api/v1/webhooks/notification</span>
+                      <span className="text-xs text-gray-500 ml-auto">POST /api/webhooks/test</span>
                     </div>
                     {import.meta.env.PROD && (
                       <div className="bg-red-500/10 border border-red-500/40 rounded-lg p-2.5 flex items-start gap-2 text-xs text-red-300">
@@ -1409,14 +1306,26 @@ export default function App() {
                         </div>
                       </div>
                     )}
+                    {whPrefilling && (
+                      <div className="flex items-center gap-2 bg-purple-500/10 border border-purple-500/40 rounded-lg p-2.5 text-xs text-purple-300">
+                        <Loader2 size={14} className="animate-spin flex-shrink-0"/>
+                        Recibiendo los datos del banco… cargando el webhook.
+                      </div>
+                    )}
+                    {!whPrefilling && whPrefillNote && (
+                      <div className="flex items-start gap-2 bg-green-500/10 border border-green-500/40 rounded-lg p-2.5 text-xs text-green-300">
+                        <CheckCircle2 size={14} className="flex-shrink-0 mt-0.5"/>
+                        {whPrefillNote}
+                      </div>
+                    )}
                     {(Object.keys(whForm) as Array<keyof typeof whForm>).map(field => (
                       <div key={field}>
                         <label className="text-gray-500 text-xs block mb-0.5">{field}</label>
-                        <input value={whForm[field]} onChange={e => setWhForm(f => ({...f, [field]: e.target.value}))}
-                          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-purple-500"/>
+                        <input value={whForm[field]} disabled={whPrefilling} onChange={e => setWhForm(f => ({...f, [field]: e.target.value}))}
+                          className={`w-full bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white text-xs focus:outline-none focus:border-purple-500 ${whPrefilling ? "animate-pulse opacity-50" : ""}`}/>
                       </div>
                     ))}
-                    <button onClick={sendWebhook} disabled={whLoading}
+                    <button onClick={sendWebhook} disabled={whLoading || whPrefilling}
                       className="w-full flex items-center justify-center gap-2 py-2 bg-purple-600 hover:bg-purple-500 rounded-lg text-white text-xs font-bold transition-colors disabled:opacity-50">
                       <Send size={13} className={whLoading ? "animate-pulse" : ""}/>
                       {whLoading ? "Enviando…" : "Disparar Webhook"}
@@ -1441,7 +1350,7 @@ export default function App() {
                   <div className="flex items-center gap-2 mb-3">
                     <RotateCcw size={14} className="text-yellow-400"/>
                     <span className="text-white font-semibold text-sm">Actuator Refresh — P2P Service</span>
-                    <span className="text-xs text-gray-500 ml-auto">POST /actuator/refresh</span>
+                    <span className="text-xs text-gray-500 ml-auto">POST /api/admin/p2p/refresh</span>
                   </div>
                   <p className="text-gray-500 text-xs mb-3">
                     Recarga en caliente las propiedades del Config Server en el microservicio P2P sin reinicio.
@@ -1456,76 +1365,6 @@ export default function App() {
                       {refreshResult}
                     </pre>
                   )}
-                </div>
-              </div>
-            )}
-
-            {/* ══════════ CONFIG SERVER ══════════ */}
-            {activeTab === "config" && (
-              <div className="space-y-4">
-                <h2 className="text-white font-bold text-base flex items-center gap-2">
-                  <Settings size={16} className="text-green-400"/> Config Server
-                </h2>
-
-                <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
-                  <p className="text-gray-400 text-xs">
-                    Consulta la configuración del microservicio <code className="text-green-400">msvc-webhooks</code> por perfil de entorno.
-                  </p>
-                  <div className="flex items-center gap-3 flex-wrap">
-                    <div>
-                      <label className="text-gray-500 text-xs block mb-1">Perfil</label>
-                      <select value={configEnv} onChange={e => setConfigEnv(e.target.value as "default"|"staging"|"prod")}
-                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-white text-xs focus:outline-none focus:border-green-500">
-                        <option value="default">default</option>
-                        <option value="staging">staging</option>
-                        <option value="prod">prod</option>
-                      </select>
-                    </div>
-                    <button onClick={loadConfig} disabled={configLoading}
-                      className="mt-4 flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded-lg text-white text-xs font-bold transition-colors disabled:opacity-50">
-                      <Database size={13} className={configLoading ? "animate-pulse" : ""}/>
-                      {configLoading ? "Cargando…" : "Cargar Config"}
-                    </button>
-                  </div>
-                  <div className="text-xs text-gray-600">
-                    URL: {ENDPOINTS.config[`webhooks${configEnv.charAt(0).toUpperCase() + configEnv.slice(1)}` as keyof typeof ENDPOINTS.config]}
-                  </div>
-
-                  {configData && (
-                    <div className="relative">
-                      <button onClick={() => navigator.clipboard.writeText(configData)}
-                        className="absolute top-2 right-2 text-gray-500 hover:text-white flex items-center gap-1 text-xs">
-                        <Copy size={12}/> Copiar
-                      </button>
-                      <pre className="text-xs bg-gray-950 text-green-300 rounded-xl p-4 overflow-x-auto max-h-96 border border-gray-800">
-                        {configData}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-
-                {/* Config Refresh */}
-                <div className="bg-gray-900 border border-orange-500/20 rounded-xl p-4">
-                  <div className="flex items-center gap-2 mb-2">
-                    <RotateCcw size={14} className="text-orange-400"/>
-                    <span className="text-white font-semibold text-sm">Config Server Actuator Refresh</span>
-                  </div>
-                  <p className="text-gray-500 text-xs mb-3">
-                    Ejecuta <code className="text-orange-400">/actuator/refresh</code> en el Config Server:{" "}
-                    <span className="text-gray-600">{ENDPOINTS.health.configRefresh}</span>
-                  </p>
-                  <button onClick={async () => {
-                    addLog("INFO", "Config Server refresh…");
-                    try {
-                      const res = await fetch(ENDPOINTS.health.configRefresh, { method: "GET", signal: AbortSignal.timeout(10000) });
-                      addLog(res.ok ? "OK" : "WARN", `Config refresh: HTTP ${res.status}`);
-                    } catch (e: unknown) {
-                      addLog("ERROR", e instanceof Error ? e.message : "Error");
-                    }
-                  }}
-                    className="flex items-center gap-2 px-4 py-2 bg-orange-600/20 hover:bg-orange-600/30 border border-orange-500/40 rounded-lg text-orange-400 text-xs font-bold transition-colors">
-                    <RotateCcw size={13}/> Refresh Config Server
-                  </button>
                 </div>
               </div>
             )}
