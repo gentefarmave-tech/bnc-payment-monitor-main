@@ -1399,6 +1399,16 @@ export default function App() {
                       <span className="text-white font-semibold text-sm">Disparar Webhook</span>
                       <span className="text-xs text-gray-500 ml-auto">POST /api/v1/webhooks/notification</span>
                     </div>
+                    {import.meta.env.PROD && (
+                      <div className="bg-red-500/10 border border-red-500/40 rounded-lg p-2.5 flex items-start gap-2 text-xs text-red-300">
+                        <AlertTriangle size={14} className="text-red-400 flex-shrink-0 mt-0.5"/>
+                        <div>
+                          <strong>Modo prueba en PRODUCCIÓN.</strong> Este envío genera un evento real contra el
+                          webhook de producción (se audita y puede confirmar una transacción). Úsalo solo con una
+                          referencia de prueba conocida.
+                        </div>
+                      </div>
+                    )}
                     {(Object.keys(whForm) as Array<keyof typeof whForm>).map(field => (
                       <div key={field}>
                         <label className="text-gray-500 text-xs block mb-0.5">{field}</label>
