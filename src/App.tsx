@@ -17,6 +17,10 @@ import {
   RotateCcw, Wifi, WifiOff, Eye, EyeOff, Terminal,
   Play, Shield, Webhook,
 } from "lucide-react";
+import {
+  describeAuditEvent, WEBHOOK_OK_STATUSES, WEBHOOK_BAD_STATUSES,
+  type WebhookAudit, type EventLevel,
+} from "./eventos";
 
 // ─────────────────────────────────────────────────────────────
 // ENDPOINTS REALES — mapeados de la colección Postman
@@ -74,6 +78,8 @@ const ENDPOINTS = {
 // (locales via .env, en Railway via Variables del servicio). Si faltan,
 // la app sigue arrancando pero avisa en consola y los requests que las
 // necesiten van a fallar con 401/403 hasta que se configuren.
+// El disparador de webhooks de prueba queda OCULTO salvo que se active explicitamente.
+const ENABLE_WEBHOOK_TRIGGER = import.meta.env.VITE_ENABLE_WEBHOOK_TRIGGER === "true";
 const API_KEY    = import.meta.env.VITE_BNC_API_KEY    || "";
 const AUTH_TOKEN = import.meta.env.VITE_BNC_AUTH_TOKEN || "";
 if (!API_KEY || !AUTH_TOKEN) {
@@ -127,7 +133,7 @@ interface Transaction {
 // Ver hallazgo-timeout-p2p-transaccion-huerfana.md: la "ventana de espera"
 // usa el mismo umbral que el job de reconciliación activa (20 min,
 // p2p.reconciliation.stuck-after-minutes en Config Server).
-type WebhookCorrStatus = "RECEIVED" | "PENDING" | "MISSING" | "NA";
+type WebhookCorrStatus = "RECEIVED" | "PENDING" | "MISSING" | "INVALID" | "NA";
 
 interface WebhookCorrelationRow {
   operationRef: string;
@@ -135,23 +141,12 @@ interface WebhookCorrelationRow {
   beneficiaryId: string;
   amount: number;
   bankCode: number;
-  p2pStatus: "SUCCESS" | "FAILED";
+  p2pStatus: string;
   p2pAt: string;
   webhookStatus: WebhookCorrStatus;
   webhookAt: string | null;
   latencyMs: number | null;
-}
-
-interface WebhookAudit {
-  eventId: string;
-  eventType: string | null;
-  transactionId: string | null;
-  status: string;
-  detail: string | null;
-  timestamp: string;
-  ipOrigin: string | null;
-  projectSource: string | null;
-  paymentCategory: string | null;
+  webhookNote: string | null;
 }
 
 const WEBHOOK_WAIT_WINDOW_MINUTES = 20;
@@ -176,24 +171,31 @@ function buildWebhookCorrelation(txList: Transaction[], audits: WebhookAudit[]):
         .filter(a => !!tx.referenceNumber && a.transactionId === tx.referenceNumber)
         .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
 
-      const success = matches.find(a => a.status === "WEBHOOK_SUCCESS" || a.status === "WEBHOOK_RECEIVED");
-      const processing = matches.find(a => a.status === "WEBHOOK_PROCESSING");
-      const errored = matches.find(a => a.status === "WEBHOOK_ERROR" || a.status === "WEBHOOK_DUPLICATE");
+      // El cierre de la notificacion es el evento terminal MAS RECIENTE
+      // (matches viene ordenado de mas nuevo a mas viejo): si el banco reenvia
+      // la notificacion corregida, el SUCCESS posterior le gana al ERROR previo.
+      const terminal = matches.find(a => WEBHOOK_OK_STATUSES.includes(a.status) || WEBHOOK_BAD_STATUSES.includes(a.status));
+      const inFlight = matches.find(a => a.status === "WEBHOOK_PROCESSING" || a.status === "WEBHOOK_RECEIVED");
 
       let webhookStatus: WebhookCorrStatus;
       let webhookAt: string | null = null;
       let latencyMs: number | null = null;
+      let webhookNote: string | null = null;
 
-      if (tx.status !== "SUCCESS") {
+      if (tx.status === "FAILED") {
         webhookStatus = "NA";
-      } else if (success) {
+      } else if (terminal && WEBHOOK_OK_STATUSES.includes(terminal.status)) {
         webhookStatus = "RECEIVED";
-        webhookAt = success.timestamp;
-        latencyMs = new Date(success.timestamp).getTime() - new Date(tx.createdAt).getTime();
-      } else if (processing) {
+        webhookAt = terminal.timestamp;
+        latencyMs = new Date(terminal.timestamp).getTime() - new Date(tx.createdAt).getTime();
+      } else if (terminal) {
+        // Llego, pero fue rechazada: NO es lo mismo que "no llego" ni que "pago fallido".
+        webhookStatus = "INVALID";
+        webhookAt = terminal.timestamp;
+        const ex = describeAuditEvent(terminal);
+        webhookNote = ex.why ?? ex.title;
+      } else if (inFlight) {
         webhookStatus = "PENDING";
-      } else if (errored) {
-        webhookStatus = "MISSING";
       } else {
         const minutesSinceP2P = (now - new Date(tx.createdAt).getTime()) / 60000;
         webhookStatus = minutesSinceP2P < WEBHOOK_WAIT_WINDOW_MINUTES ? "PENDING" : "MISSING";
@@ -205,11 +207,13 @@ function buildWebhookCorrelation(txList: Transaction[], audits: WebhookAudit[]):
         beneficiaryId: tx.beneficiaryId ?? "—",
         amount: tx.amount,
         bankCode: tx.bankCode ?? 0,
-        p2pStatus: tx.status === "SUCCESS" ? "SUCCESS" : "FAILED",
+        // Mismo estado que la pestaña Transacciones (viene de la BD), sin reinterpretarlo.
+        p2pStatus: tx.status,
         p2pAt: tx.createdAt,
         webhookStatus,
         webhookAt,
         latencyMs,
+        webhookNote,
       };
       return row;
     });
@@ -220,6 +224,7 @@ function webhookCorrBadge(status: WebhookCorrStatus): { label: string; className
     case "RECEIVED": return { label: "Recibido",    className: "bg-green-500/15 text-green-400" };
     case "PENDING":  return { label: "Pendiente",   className: "bg-yellow-500/15 text-yellow-400" };
     case "MISSING":  return { label: "No recibido", className: "bg-red-500/15 text-red-400" };
+    case "INVALID":  return { label: "Rechazado (dato inválido)", className: "bg-orange-500/15 text-orange-400" };
     default:         return { label: "N/A",         className: "bg-gray-500/15 text-gray-400" };
   }
 }
@@ -424,7 +429,13 @@ export default function App() {
   const [refreshResult, setRefreshResult] = useState("");
   const [refreshLoading, setRefreshLoading] = useState(false);
 
-  // Logs
+  // Actividad de pagos (log legible para el usuario de la pasarela)
+  const [logView, setLogView]           = useState<"pagos" | "panel">("pagos");
+  const [onlyProblems, setOnlyProblems] = useState(false);
+  const [logSearch, setLogSearch]       = useState("");
+  const [showTech, setShowTech]         = useState(false);
+
+  // Logs (sesion del panel)
   const [logs, setLogs]             = useState<LogEntry[]>([]);
   const logsEndRef                  = useRef<HTMLDivElement>(null);
 
@@ -695,10 +706,10 @@ export default function App() {
 
   // ── Load transactions when tab opens ─────────────────────
   useEffect(() => {
-    if (authed && (activeTab === "transactions" || activeTab === "overview" || activeTab === "webhookcorr")) {
+    if (authed && (activeTab === "transactions" || activeTab === "overview" || activeTab === "webhookcorr" || activeTab === "logs")) {
       fetchTransactions();
     }
-    if (authed && activeTab === "webhookcorr") {
+    if (authed && (activeTab === "webhookcorr" || activeTab === "logs")) {
       fetchWebhookAudits();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -709,6 +720,30 @@ export default function App() {
     () => buildWebhookCorrelation(txList, webhookAudits),
     [txList, webhookAudits]
   );
+
+  // ── Actividad de pagos: eventos de auditoria traducidos y enlazados a su pago ──
+  const activityRows = useMemo(() => {
+    const q = logSearch.trim().toLowerCase();
+    return [...webhookAudits]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .map(a => {
+        const ex = describeAuditEvent(a);
+        // Los eventos del webhook usan la referencia del banco; el de "pago iniciado" usa operationRef.
+        const tx = txList.find(t => t.operationRef === a.transactionId || (!!t.referenceNumber && t.referenceNumber === a.transactionId));
+        const who = tx ? `${tx.name ?? "—"} · Bs. ${tx.amount.toLocaleString("es-VE")}` : null;
+        return { a, ex, tx, who };
+      })
+      .filter(r => !onlyProblems || r.ex.level === "error" || r.ex.level === "warn")
+      .filter(r => !q || [r.a.transactionId, r.tx?.operationRef, r.tx?.referenceNumber, r.tx?.name, r.ex.title]
+        .some(v => (v ?? "").toLowerCase().includes(q)));
+  }, [webhookAudits, txList, onlyProblems, logSearch]);
+
+  const levelStyle: Record<EventLevel, { dot: string; text: string }> = {
+    ok:    { dot: "bg-green-500",  text: "text-green-400" },
+    info:  { dot: "bg-blue-500",   text: "text-blue-400" },
+    warn:  { dot: "bg-yellow-500", text: "text-yellow-400" },
+    error: { dot: "bg-red-500",    text: "text-red-400" },
+  };
 
   // ─────────────────────────────────────────────────────────
   // LOGIN SCREEN
@@ -772,7 +807,7 @@ export default function App() {
     { id: "webhookcorr",  icon: <Webhook size={16}/>,        label: "Correlación Webhook" },
     { id: "p2p",          icon: <ArrowLeftRight size={16}/>, label: "P2P / Webhooks" },
     { id: "config",       icon: <Settings size={16}/>,     label: "Config Server" },
-    { id: "logs",         icon: <Terminal size={16}/>,     label: "Logs" },
+    { id: "logs",         icon: <Terminal size={16}/>,     label: "Actividad" },
   ] as const;
 
   const upCount   = services.filter(s => s.status === "UP").length;
@@ -1253,7 +1288,8 @@ export default function App() {
                   <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-green-500"/> Webhook confirmado</span>
                   <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-yellow-500"/> Pendiente (dentro de la ventana de espera)</span>
                   <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-500"/> No recibido (superó la ventana)</span>
-                  <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-gray-500"/> N/A — el P2P no fue exitoso</span>
+                  <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-orange-500"/> Rechazado: llegó con un dato inválido (el pago sigue en espera)</span>
+                  <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-gray-500"/> N/A — el P2P falló</span>
                 </div>
 
                 {webhookCorrRows.length === 0 ? (
@@ -1291,6 +1327,9 @@ export default function App() {
                                 <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${badge.className}`}>
                                   {badge.label}
                                 </span>
+                                {row.webhookNote && (
+                                  <div className="text-orange-300/80 mt-1 max-w-[260px] whitespace-normal">{row.webhookNote}</div>
+                                )}
                               </td>
                               <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">
                                 {row.webhookAt ? row.webhookAt.slice(11,19) : "—"}
@@ -1307,7 +1346,7 @@ export default function App() {
                 )}
 
                 <div className="text-gray-600 text-xs px-1">
-                  {webhookCorrRows.length} transaccion(es) P2P · cruce por número de referencia (operationRef) contra {webhookAudits.length} registro(s) de auditoría de webhooks.
+                  {webhookCorrRows.length} transaccion(es) P2P · cruce por número de referencia del banco (referenceNumber) contra {webhookAudits.length} registro(s) de auditoría de webhooks.
                 </div>
               </div>
             )}
@@ -1352,7 +1391,8 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Webhook Form */}
+                  {/* Webhook Form — solo si VITE_ENABLE_WEBHOOK_TRIGGER=true (apagado por defecto: el incidente del 2026-09-02 fue un webhook de prueba disparado desde produccion) */}
+                  {ENABLE_WEBHOOK_TRIGGER && (
                   <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
                     <div className="flex items-center gap-2 mb-2">
                       <Bell size={14} className="text-purple-400"/>
@@ -1383,6 +1423,7 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  )}
                 </div>
 
                 {/* P2P Actuator Refresh */}
@@ -1482,33 +1523,111 @@ export default function App() {
             {/* ══════════ LOGS ══════════ */}
             {activeTab === "logs" && (
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between flex-wrap gap-2">
                   <h2 className="text-white font-bold text-base flex items-center gap-2">
-                    <Terminal size={16} className="text-green-400"/> Activity Log
+                    <Terminal size={16} className="text-green-400"/> Actividad
                   </h2>
-                  <button onClick={() => setLogs([])}
-                    className="text-xs text-gray-500 hover:text-red-400 transition-colors">
-                    Limpiar
-                  </button>
+                  <div className="flex items-center gap-2 text-xs">
+                    <button onClick={() => setLogView("pagos")}
+                      className={`px-3 py-1.5 rounded-lg font-semibold ${logView === "pagos" ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}>
+                      Pagos y notificaciones
+                    </button>
+                    <button onClick={() => setLogView("panel")}
+                      className={`px-3 py-1.5 rounded-lg font-semibold ${logView === "panel" ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}>
+                      Sesión del panel
+                    </button>
+                  </div>
                 </div>
-                <div className="bg-gray-950 border border-gray-800 rounded-xl p-4 h-[60vh] overflow-y-auto font-mono text-xs space-y-1">
-                  {logs.length === 0 && (
-                    <span className="text-gray-600">Sin actividad aún. Ejecuta un Check All o carga transacciones.</span>
-                  )}
-                  {logs.map((l, i) => (
-                    <div key={i} className="flex gap-2">
-                      <span className="text-gray-600 flex-shrink-0">{l.ts}</span>
-                      <span className={`flex-shrink-0 font-bold ${
-                        l.level === "OK"    ? "text-green-400" :
-                        l.level === "ERROR" ? "text-red-400"   :
-                        l.level === "WARN"  ? "text-yellow-400":
-                        "text-blue-400"
-                      }`}>[{l.level}]</span>
-                      <span className="text-gray-300">{l.message}</span>
+
+                {logView === "pagos" && (
+                  <>
+                    <div className="flex items-center gap-2 flex-wrap text-xs">
+                      <button onClick={() => { fetchTransactions(); fetchWebhookAudits(); }} disabled={txLoading || webhookCorrLoading}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-green-600 hover:bg-green-500 rounded-lg text-white font-semibold disabled:opacity-50">
+                        <RefreshCw size={13} className={(txLoading || webhookCorrLoading) ? "animate-spin" : ""}/> Actualizar
+                      </button>
+                      <button onClick={() => setOnlyProblems(v => !v)}
+                        className={`px-3 py-1.5 rounded-lg font-semibold ${onlyProblems ? "bg-red-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}>
+                        Solo lo que requiere atención
+                      </button>
+                      <button onClick={() => setShowTech(v => !v)}
+                        className={`px-3 py-1.5 rounded-lg font-semibold ${showTech ? "bg-gray-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}>
+                        Detalle técnico (operador)
+                      </button>
+                      <input value={logSearch} onChange={e => setLogSearch(e.target.value)}
+                        placeholder="Buscar por referencia, nombre…"
+                        className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 placeholder-gray-600 w-60"/>
                     </div>
-                  ))}
-                  <div ref={logsEndRef}/>
-                </div>
+
+                    {webhookCorrError && (
+                      <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-3 text-xs text-red-300">
+                        No se pudo cargar la actividad: {webhookCorrError}
+                      </div>
+                    )}
+
+                    <div className="bg-gray-900 border border-gray-800 rounded-xl divide-y divide-gray-800/60 max-h-[65vh] overflow-y-auto">
+                      {activityRows.length === 0 && (
+                        <div className="p-8 text-center text-gray-500 text-sm">
+                          {onlyProblems ? "Sin eventos que requieran atención." : "Sin actividad registrada todavía."}
+                        </div>
+                      )}
+                      {activityRows.map(({ a, ex, who }) => (
+                        <div key={a.eventId} className="px-4 py-3 flex gap-3">
+                          <span className={`mt-1.5 w-2 h-2 rounded-full flex-shrink-0 ${levelStyle[ex.level].dot}`}/>
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex items-baseline gap-2 flex-wrap">
+                              <span className="text-gray-500 text-xs whitespace-nowrap">
+                                {a.timestamp.slice(0, 10)} {a.timestamp.slice(11, 19)}
+                              </span>
+                              <span className={`text-sm font-semibold ${levelStyle[ex.level].text}`}>{ex.title}</span>
+                            </div>
+                            {(who || a.transactionId) && (
+                              <div className="text-xs text-gray-500">
+                                {who ? `${who} · ` : ""}Ref. {a.transactionId}
+                              </div>
+                            )}
+                            {ex.why && <div className="text-xs text-gray-300">{ex.why}</div>}
+                            {ex.action && <div className="text-xs text-gray-400"><strong className="text-gray-300">Qué hacer:</strong> {ex.action}</div>}
+                            {showTech && ex.technical && (
+                              <pre className="mt-1.5 bg-gray-950 border border-gray-800 rounded p-2 text-[10px] text-gray-500 whitespace-pre-wrap break-all">
+{a.status} · {a.projectSource ?? "—"}{a.ipOrigin ? ` · ${a.ipOrigin}` : ""}{"\n"}{ex.technical}
+                              </pre>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="text-gray-600 text-xs px-1">{activityRows.length} evento(s) · más recientes primero</div>
+                  </>
+                )}
+
+                {logView === "panel" && (
+                  <>
+                    <div className="flex justify-end">
+                      <button onClick={() => setLogs([])} className="text-xs text-gray-500 hover:text-red-400 transition-colors">
+                        Limpiar
+                      </button>
+                    </div>
+                    <div className="bg-gray-950 border border-gray-800 rounded-xl p-4 h-[60vh] overflow-y-auto font-mono text-xs space-y-1">
+                      {logs.length === 0 && (
+                        <span className="text-gray-600">Sin actividad aún. Ejecuta un Check All o carga transacciones.</span>
+                      )}
+                      {logs.map((l, i) => (
+                        <div key={i} className="flex gap-2">
+                          <span className="text-gray-600 flex-shrink-0">{l.ts}</span>
+                          <span className={`flex-shrink-0 font-bold ${
+                            l.level === "OK"    ? "text-green-400" :
+                            l.level === "ERROR" ? "text-red-400"   :
+                            l.level === "WARN"  ? "text-yellow-400":
+                            "text-blue-400"
+                          }`}>[{l.level}]</span>
+                          <span className="text-gray-300">{l.message}</span>
+                        </div>
+                      ))}
+                      <div ref={logsEndRef}/>
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
