@@ -65,6 +65,13 @@ function jsonFrom(detail: string | null): Record<string, unknown> | null {
   try { return JSON.parse(detail.slice(i)); } catch { return null; }
 }
 
+/** Errores de validacion del BNC: {"Description":["El campo Descripción es inválido"]} -> "Description: El campo ... inválido" */
+function fieldErrors(detail: string | null): string {
+  const out: string[] = [];
+  for (const m of String(detail ?? "").matchAll(/"(\w+)":\s*\["([^"]+)"\]/g)) out.push(`${m[1]}: ${m[2]}`);
+  return out.join("; ");
+}
+
 export function describeAuditEvent(a: WebhookAudit): EventExplanation {
   const technical = a.detail ?? "";
   const payload = jsonFrom(a.detail);
@@ -111,6 +118,38 @@ export function describeAuditEvent(a: WebhookAudit): EventExplanation {
       return { level: "error", title: "No se pudo registrar la confirmación del pago",
         why: "La notificación llegó bien, pero falló el paso interno que la procesa.",
         action: "La notificación quedó respaldada. Contacta a soporte para reprocesarla; no reenvíes el pago.", technical };
+
+    // ── Eventos del propio msvc-p2p (vienen de monitor-api /api/p2p-audit) ──
+    case "P2P_BANK_REJECTED":
+      return { level: "error", title: "El banco rechazó el pago",
+        why: `El banco indicó: ${technical.replace(/^BNC\s+\w+:\s*/, "")}`,
+        action: "El pago NO se realizó (no se movió dinero). Corrige el dato indicado y envía un pago nuevo.", technical };
+
+    case "P2P_BANK_UNCERTAIN": {
+      const f = fieldErrors(a.detail);
+      if (f) {
+        return { level: "warn", title: "El banco respondió con un error de datos",
+          why: `El banco indicó: ${f}`,
+          action: "Lo más probable es que el pago no se haya procesado. Corrige el dato y envía un pago nuevo; la verificación automática confirmará el estado de este.", technical };
+      }
+      return { level: "warn", title: "El banco no confirmó si procesó el pago",
+        why: "No hubo una respuesta clara del banco (tiempo agotado o error de conexión).",
+        action: "No envíes el pago otra vez: el sistema lo verificará con el banco automáticamente.", technical };
+    }
+
+    case "P2P_BUS_OFFLINE":
+      return { level: "error", title: "El pago se hizo, pero no se pudo avisar al proceso interno",
+        why: "El banco aceptó el pago y falló el aviso interno (RabbitMQ).",
+        action: "La confirmación del banco lo cerrará cuando llegue. Si no llega, contacta a soporte.", technical };
+
+    case "P2P_RECONCILIATION_EXHAUSTED":
+      return { level: "error", title: "No se pudo confirmar el pago con el banco",
+        why: "Se agotaron los intentos automáticos de verificación.",
+        action: "Revisión manual: consulta el estado de la operación en el banco. Si no existe, el pago no se realizó.", technical };
+
+    case "P2P_ERROR":
+      return { level: "error", title: "Error al procesar el pago", why: technical || undefined,
+        action: "Contacta a soporte indicando la hora del evento.", technical };
 
     case "ERROR": {
       const m = technical.match(/Transaction not found for reference:\s*(\S+)/i);
