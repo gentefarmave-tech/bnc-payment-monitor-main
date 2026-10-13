@@ -300,6 +300,13 @@ export default function App() {
   const [txFilter, setTxFilter]     = useState({ type: "", status: "", from: "", to: "", amount: "", beneficiary: "", operationRef: "", page: 0 });
   const [txLoading, setTxLoading]   = useState(false);
   const [txDetail, setTxDetail]     = useState<Transaction | null>(null);
+  // Cierre manual de un pago PROCESSING / UNCONFIRMED (solo admin)
+  const [closeOpen, setCloseOpen]     = useState(false);
+  const [closeStatus, setCloseStatus] = useState<"SUCCESS" | "FAILED">("FAILED");
+  const [closeReason, setCloseReason] = useState("");
+  const [closeForce, setCloseForce]   = useState(false);
+  const [closeBusy, setCloseBusy]     = useState(false);
+  const [closeMsg, setCloseMsg]       = useState("");
   const [txSearch, setTxSearch]     = useState("");
 
   // Correlación P2P ↔ Webhook
@@ -605,6 +612,36 @@ export default function App() {
       addLog("ERROR", msg);
     }
     setRefreshLoading(false);
+  };
+
+  // ── Cierre manual de un pago sin confirmar ────────────────
+  const closeTransaction = async () => {
+    if (!txDetail) return;
+    setCloseBusy(true);
+    setCloseMsg("");
+    try {
+      const res = await api(`/api/p2p/transactions/${encodeURIComponent(txDetail.operationRef)}/close`, {
+        method: "POST",
+        body: { status: closeStatus, reason: closeReason, force: closeForce },
+        timeoutMs: 35000,
+      });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setCloseMsg(`Cerrado como ${d.result}. ${d.note ?? ""}`.trim());
+        addLog("OK", `Cierre manual de ${txDetail.operationRef}: ${d.result}`);
+        setCloseOpen(false);
+        setCloseReason("");
+        setCloseForce(false);
+        await fetchTxDetail(String(txDetail.id));
+      } else {
+        setCloseMsg(d.error ?? d.message ?? `Error HTTP ${res.status}`);
+        addLog("WARN", `Cierre manual de ${txDetail.operationRef}: HTTP ${res.status}`);
+      }
+    } catch (err: unknown) {
+      setCloseMsg(err instanceof Error ? err.message : "Error");
+    } finally {
+      setCloseBusy(false);
+    }
   };
 
   // ── Fetch tx detail ───────────────────────────────────────
@@ -1092,6 +1129,42 @@ export default function App() {
                     {txSituation(txDetail) && (
                       <div className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-200">
                         <span className="font-semibold">Situación del pago: </span>{txSituation(txDetail)!.long}
+                      </div>
+                    )}
+                    {getSession()?.role === "admin" && (txDetail.status === "UNCONFIRMED" || txDetail.status === "PROCESSING") && (
+                      <div className="mb-3">
+                        {!closeOpen ? (
+                          <button onClick={() => { setCloseOpen(true); setCloseMsg(""); }}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-orange-500/20 text-orange-300 border border-orange-500/40 hover:bg-orange-500/30">
+                            Cerrar manualmente este pago
+                          </button>
+                        ) : (
+                          <div className="rounded-lg border border-orange-500/40 bg-gray-950 p-3 space-y-2 text-xs text-gray-300">
+                            <div className="text-orange-300 font-semibold">Cierre manual</div>
+                            <p className="text-gray-400">Antes de marcarlo como fallido, el sistema consulta al banco. Si el banco confirma que el pago existe, se cierra como exitoso. Queda registrado quién lo cerró y por qué.</p>
+                            <div className="flex gap-4">
+                              <label><input type="radio" checked={closeStatus === "FAILED"} onChange={() => setCloseStatus("FAILED")} /> Marcar como fallido</label>
+                              <label><input type="radio" checked={closeStatus === "SUCCESS"} onChange={() => setCloseStatus("SUCCESS")} /> Marcar como exitoso</label>
+                            </div>
+                            <textarea value={closeReason} onChange={e => setCloseReason(e.target.value)} rows={2} maxLength={300}
+                              placeholder="Motivo (obligatorio, mínimo 5 caracteres). Ej: el banco no registra la operación tras revisarla."
+                              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-white focus:outline-none focus:border-orange-500" />
+                            {closeStatus === "FAILED" && (
+                              <label className="flex items-center gap-2 text-gray-500">
+                                <input type="checkbox" checked={closeForce} onChange={e => setCloseForce(e.target.checked)} />
+                                Forzar si el banco no pudo consultarse (bajo mi responsabilidad)
+                              </label>
+                            )}
+                            <div className="flex gap-2">
+                              <button onClick={closeTransaction} disabled={closeBusy || closeReason.trim().length < 5}
+                                className="px-3 py-1.5 rounded-lg font-semibold bg-orange-500 text-black disabled:opacity-40">
+                                {closeBusy ? "Cerrando…" : "Confirmar cierre"}
+                              </button>
+                              <button onClick={() => setCloseOpen(false)} className="px-3 py-1.5 rounded-lg border border-gray-700 text-gray-400">Cancelar</button>
+                            </div>
+                          </div>
+                        )}
+                        {closeMsg && <div className="mt-2 text-xs text-yellow-200">{closeMsg}</div>}
                       </div>
                     )}
                     <pre className="text-xs text-gray-300 overflow-x-auto">{JSON.stringify(txDetail, null, 2)}</pre>
