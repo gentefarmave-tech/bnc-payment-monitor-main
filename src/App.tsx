@@ -221,7 +221,29 @@ const txStatusColor = (s: string) => {
   if (s === "SUCCESS")    return "text-green-400 bg-green-400/10";
   if (s === "FAILED")     return "text-red-400 bg-red-400/10";
   if (s === "PROCESSING") return "text-yellow-400 bg-yellow-400/10";
+  if (s === "UNCONFIRMED") return "text-orange-400 bg-orange-400/10";
   return "text-gray-400 bg-gray-700";
+};
+
+// Explica en lenguaje simple en que situacion esta un pago que aun no esta cerrado (PROCESSING / UNCONFIRMED).
+const txSituation = (tx: Transaction): { short: string; long: string } | null => {
+  const n = tx.reconciliationAttempts ?? 0;
+  const last = tx.lastReconciliationAt ? ` Última consulta al banco: ${tx.lastReconciliationAt.slice(0, 16).replace("T", " ")}.` : "";
+  if (tx.status === "PROCESSING") {
+    return {
+      short: n > 0 ? `verificando con el banco (${n}/5)` : "esperando confirmación",
+      long: n > 0
+        ? `El pago fue enviado al banco y aún no llega su confirmación. El sistema ya le preguntó al banco ${n} vez/veces (máximo 5, una cada 5 minutos).${last} Si el banco lo encuentra, pasa a SUCCESS solo.`
+        : "El pago fue enviado al banco y se espera su confirmación. Si no llega en unos 20 minutos, el sistema le pregunta al banco automáticamente.",
+    };
+  }
+  if (tx.status === "UNCONFIRMED") {
+    return {
+      short: "el banco aún no lo confirma",
+      long: `El banco no encontró este pago después de varias consultas, pero no se marca como fallido porque podría confirmarlo con retraso. El sistema lo vuelve a consultar cada hora durante 24 horas y, si el banco lo confirma, pasa a SUCCESS solo.${last} Si pasado ese tiempo sigue sin aparecer, revisa la operación en el banco: si no existe, el pago no se realizó.`,
+    };
+  }
+  return null;
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -1005,6 +1027,7 @@ export default function App() {
                       <option value="SUCCESS">SUCCESS</option>
                       <option value="FAILED">FAILED</option>
                       <option value="PROCESSING">PROCESSING</option>
+                      <option value="UNCONFIRMED">UNCONFIRMED</option>
                     </select>
                   </div>
                   <div>
@@ -1066,6 +1089,11 @@ export default function App() {
                       <span className="text-green-400 font-bold text-sm">Detalle: {txDetail.operationRef}</span>
                       <button onClick={() => setTxDetail(null)} className="text-gray-500 hover:text-white"><XCircle size={16}/></button>
                     </div>
+                    {txSituation(txDetail) && (
+                      <div className="mb-3 rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-3 text-xs text-yellow-200">
+                        <span className="font-semibold">Situación del pago: </span>{txSituation(txDetail)!.long}
+                      </div>
+                    )}
                     <pre className="text-xs text-gray-300 overflow-x-auto">{JSON.stringify(txDetail, null, 2)}</pre>
                   </div>
                 )}
@@ -1099,6 +1127,9 @@ export default function App() {
                               <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${txStatusColor(tx.status)}`}>
                                 {tx.status}
                               </span>
+                              {txSituation(tx) && (
+                                <div className="text-[10px] text-gray-500 mt-0.5" title={txSituation(tx)!.long}>{txSituation(tx)!.short}</div>
+                              )}
                             </td>
                             <td className="px-3 py-2.5 text-white font-bold">{tx.amount?.toLocaleString("es-VE")}</td>
                             <td className="px-3 py-2.5 text-gray-300">{tx.name ?? "—"}</td>

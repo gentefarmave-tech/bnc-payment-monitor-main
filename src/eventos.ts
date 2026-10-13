@@ -143,9 +143,9 @@ export function describeAuditEvent(a: WebhookAudit): EventExplanation {
         action: "La confirmación del banco lo cerrará cuando llegue. Si no llega, contacta a soporte.", technical };
 
     case "P2P_RECONCILIATION_EXHAUSTED":
-      return { level: "error", title: "No se pudo confirmar el pago con el banco",
-        why: "Se agotaron los intentos automáticos de verificación.",
-        action: "Revisión manual: consulta el estado de la operación en el banco. Si no existe, el pago no se realizó.", technical };
+      return { level: "warn", title: "El banco aún no confirma este pago (estado: sin confirmar)",
+        why: "Se consultó al banco varias veces y no encontró la operación. No se marca como fallido porque el banco podría confirmarlo con retraso.",
+        action: "El sistema lo sigue verificando cada hora durante 24 horas y, si el banco lo confirma, pasa a exitoso solo. Si pasado ese tiempo no aparece, revisa la operación en el banco: si no existe, el pago no se realizó.", technical };
 
     case "P2P_ERROR":
       return { level: "error", title: "Error al procesar el pago", why: technical || undefined,
