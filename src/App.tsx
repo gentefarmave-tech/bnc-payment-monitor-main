@@ -510,10 +510,19 @@ export default function App() {
     setP2pLoading(true);
     setP2pResult("");
     setWhPrefillNote("");
-    addLog("INFO", `Enviando P2P → ${p2pForm.BeneficiaryName} (${p2pForm.Amount})`);
+    // El monto acepta coma o punto decimal ("15350,33" = "15350.33") y maximo 2 decimales (Decimal 13,2 del BNC).
+    const amountText = p2pForm.Amount.trim().replace(",", ".");
+    if (!/^\d{1,11}(\.\d{1,2})?$/.test(amountText) || parseFloat(amountText) <= 0) {
+      const msg = `Monto inválido "${p2pForm.Amount}": use solo números, coma o punto decimal y máximo 2 decimales (ej. 15350,33).`;
+      setP2pResult(`ERROR: ${msg}`);
+      addLog("WARN", msg);
+      setP2pLoading(false);
+      return;
+    }
+    addLog("INFO", `Enviando P2P → ${p2pForm.BeneficiaryName} (${amountText})`);
     try {
-      const sent = { ...p2pForm };
-      const amount = parseFloat(sent.Amount);
+      const sent = { ...p2pForm, Amount: amountText };
+      const amount = parseFloat(amountText);
       const res = await api("/api/p2p/send", {
         method: "POST",
         body: { ...sent, Amount: amount, BeneficiaryBankCode: parseInt(sent.BeneficiaryBankCode) },
